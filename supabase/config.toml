@@ -1,0 +1,2 @@
+[functions.generate-recipes]
+verify_jwt = false

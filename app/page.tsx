@@ -79,8 +79,10 @@ const CATEGORIES = ["Frutas y verduras", "Carnicería", "Pescadería", "Huevos y
 const VITE_ENV = (import.meta as ImportMeta & {
   env?: { BASE_URL?: string; VITE_RECIPE_API_URL?: string };
 }).env;
-const RECIPE_API_URL = VITE_ENV?.VITE_RECIPE_API_URL?.trim() || "/api/recipes";
 const APP_BASE_URL = VITE_ENV?.BASE_URL || "/";
+const GITHUB_PAGES_RECIPE_API_URL = "https://cebqvzwdrsfgbjyxcpss.supabase.co/functions/v1/generate-recipes";
+const RECIPE_API_URL = VITE_ENV?.VITE_RECIPE_API_URL?.trim()
+  || (APP_BASE_URL === "/nutricionapp/" ? GITHUB_PAGES_RECIPE_API_URL : "/api/recipes");
 const PROTEINS = [
   { name: "pechuga de pollo", emoji: "🍗", category: "Carnicería" },
   { name: "pavo", emoji: "🥘", category: "Carnicería" },

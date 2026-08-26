@@ -27,13 +27,7 @@ jobs:
           cache: npm
       - name: Instalar dependencias
         run: npm ci
-      - name: Comprobar dirección segura de la IA
-        env:
-          VITE_RECIPE_API_URL: ${{ vars.VITE_RECIPE_API_URL }}
-        run: test -n "$VITE_RECIPE_API_URL"
       - name: Crear la aplicación
-        env:
-          VITE_RECIPE_API_URL: ${{ vars.VITE_RECIPE_API_URL }}
         run: npm run build:pages
       - name: Preparar GitHub Pages
         uses: actions/configure-pages@v5

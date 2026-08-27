@@ -1,4 +1,14 @@
-import { NextResponse } from "next/server";
+function json(data: unknown, init?: ResponseInit) {
+  return Response.json(data, init);
+}
+
+function runtimeSecret(name: string) {
+  const runtime = globalThis as typeof globalThis & {
+    Deno?: { env?: { get(key: string): string | undefined } };
+    process?: { env?: Record<string, string | undefined> };
+  };
+  return runtime.Deno?.env?.get(name) ?? runtime.process?.env?.[name];
+}
 
 type RecipeKind = "Comida" | "Cena";
 type TimeBand = "quick" | "medium" | "slow";
@@ -536,7 +546,7 @@ export async function POST(request: Request) {
       favoriteRecipes?: unknown;
       avoidRecipes?: unknown;
     };
-    if (!validateConfig(body.config)) return NextResponse.json({ error: "Configuración no válida." }, { status: 400 });
+    if (!validateConfig(body.config)) return json({ error: "Configuración no válida." }, { status: 400 });
     const config = body.config;
     const avoidTitles = Array.isArray(body.avoidTitles)
       ? body.avoidTitles.filter((title): title is string => typeof title === "string").slice(0, 30)
@@ -550,14 +560,14 @@ export async function POST(request: Request) {
       mainAccompaniments: [],
     }));
     const baseReferences = [...favorites, ...avoidRecipes, ...titleReferences];
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) return NextResponse.json({ error: "La generación con IA no está disponible." }, { status: 503 });
+    const apiKey = runtimeSecret("OPENAI_API_KEY");
+    if (!apiKey) return json({ error: "La generación con IA no está disponible." }, { status: 503 });
 
     let first: RecipesPayload;
     try {
       first = await callOpenAI(apiKey, config, favorites, [...avoidRecipes, ...titleReferences]);
     } catch {
-      return NextResponse.json({ error: "La generación con IA no está disponible." }, { status: 503 });
+      return json({ error: "La generación con IA no está disponible." }, { status: 503 });
     }
 
     const firstErrors = validatePayload(first, config, avoidTitles);
@@ -565,7 +575,7 @@ export async function POST(request: Request) {
     if (first.recipes.length === expectedTotal) {
       const invalidIndexes = invalidRecipeIndexes(first, config, baseReferences, avoidTitles);
       if (firstErrors.length === 0 && invalidIndexes.length === 0) {
-        return NextResponse.json({ recipes: addRecipeIds(first.recipes) });
+        return json({ recipes: addRecipeIds(first.recipes) });
       }
 
       const expectedKinds: RecipeKind[] = [
@@ -606,13 +616,13 @@ export async function POST(request: Request) {
           const mergedErrors = validatePayload(mergedPayload, config, avoidTitles);
           const mergedInvalid = invalidRecipeIndexes(mergedPayload, config, baseReferences, avoidTitles);
           if (mergedErrors.length === 0 && mergedInvalid.length === 0) {
-            return NextResponse.json({ recipes: addRecipeIds(merged) });
+            return json({ recipes: addRecipeIds(merged) });
           }
         }
       } catch {
         // The single, targeted retry is intentionally the cost ceiling.
       }
-      return NextResponse.json({
+      return json({
         code: "NO_DISTINCT_ALTERNATIVE",
         error: "No hemos encontrado una alternativa realmente distinta con estas preferencias. Amplía el tiempo, los utensilios o los alimentos permitidos e inténtalo de nuevo.",
       }, { status: 422 });
@@ -625,17 +635,17 @@ export async function POST(request: Request) {
         ? invalidRecipeIndexes(second, config, baseReferences, avoidTitles)
         : [0];
       if (secondErrors.length === 0 && secondInvalid.length === 0) {
-        return NextResponse.json({ recipes: addRecipeIds(second.recipes) });
+        return json({ recipes: addRecipeIds(second.recipes) });
       }
     } catch {
       // The client keeps the existing recipes and offers an explicit retry.
     }
-    return NextResponse.json({
+    return json({
       code: "NO_DISTINCT_ALTERNATIVE",
       error: "No hemos encontrado una alternativa realmente distinta con estas preferencias. Amplía el tiempo, los utensilios o los alimentos permitidos e inténtalo de nuevo.",
     }, { status: 422 });
   } catch {
-    return NextResponse.json({ error: "No se pudo procesar la solicitud." }, { status: 400 });
+    return json({ error: "No se pudo procesar la solicitud." }, { status: 400 });
   }
 }
 

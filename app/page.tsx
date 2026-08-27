@@ -76,6 +76,13 @@ const DEFAULT_CONFIG: Config = {
 
 const TOOLS = ["Sartén", "Olla rápida", "Thermomix", "Airfryer", "Horno", "Microondas"];
 const CATEGORIES = ["Frutas y verduras", "Carnicería", "Pescadería", "Huevos y refrigerados", "Legumbres, arroz y pasta", "Otros"];
+const VITE_ENV = (import.meta as ImportMeta & {
+  env?: { BASE_URL?: string; VITE_RECIPE_API_URL?: string };
+}).env;
+const APP_BASE_URL = VITE_ENV?.BASE_URL || "/";
+const GITHUB_PAGES_RECIPE_API_URL = "https://cebqvzwdrsfgbjyxcpss.supabase.co/functions/v1/generate-recipes";
+const RECIPE_API_URL = VITE_ENV?.VITE_RECIPE_API_URL?.trim()
+  || (APP_BASE_URL === "/nutricionapp/" ? GITHUB_PAGES_RECIPE_API_URL : "/api/recipes");
 const PROTEINS = [
   { name: "pechuga de pollo", emoji: "🍗", category: "Carnicería" },
   { name: "pavo", emoji: "🥘", category: "Carnicería" },
@@ -549,9 +556,19 @@ async function requestRecipes(
   config: Config,
   options: { favorites?: Recipe[]; avoidRecipes?: Recipe[]; avoidTitles?: string[] } = {},
 ) {
-  const response = await fetch("/api/recipes", {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (/^https?:\/\//i.test(RECIPE_API_URL)) {
+    let familyCode = localStorage.getItem("nutricionapp-family-code")?.trim();
+    if (!familyCode) {
+      familyCode = window.prompt("Introduce el código familiar de NUTRICIONAPP")?.trim();
+      if (!familyCode) throw new RecipeGenerationError("Necesitas el código familiar para generar recetas con IA.", "ACCESS_REQUIRED");
+      localStorage.setItem("nutricionapp-family-code", familyCode);
+    }
+    headers["x-family-code"] = familyCode;
+  }
+  const response = await fetch(RECIPE_API_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify({
       config,
       favoriteRecipes: (options.favorites ?? []).map(recipeSummary),
@@ -560,6 +577,7 @@ async function requestRecipes(
     }),
   });
   const payload = await response.json() as { recipes?: Recipe[]; error?: string; code?: string };
+  if (response.status === 401) localStorage.removeItem("nutricionapp-family-code");
   if (!response.ok) throw new RecipeGenerationError(payload.error ?? "La generación con IA no está disponible.", payload.code);
   if (!Array.isArray(payload.recipes) || payload.recipes.length !== config.lunches + config.dinners) {
     throw new Error("AI generation returned an invalid recipe count");
@@ -623,7 +641,9 @@ export default function Home() {
       } catch { /* A damaged local draft should never prevent the app from opening. */ }
       setHydrated(true);
     });
-    if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => undefined);
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register(`${APP_BASE_URL}sw.js`, { scope: APP_BASE_URL }).catch(() => undefined);
+    }
     return () => window.cancelAnimationFrame(frame);
   }, []);
 
@@ -648,7 +668,7 @@ export default function Home() {
       setWizardOpen(false); setSection("recetas");
       setToast("Tu nuevo menú con IA está listo");
     } catch (error) {
-      if (error instanceof RecipeGenerationError && error.code === "NO_DISTINCT_ALTERNATIVE") {
+      if (error instanceof RecipeGenerationError && ["NO_DISTINCT_ALTERNATIVE", "ACCESS_REQUIRED", "ACCESS_DENIED"].includes(error.code ?? "")) {
         setGenerationWarning(error.message);
         return;
       }

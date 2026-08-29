@@ -16,6 +16,7 @@ type Config = {
   otherTool: string;
   allergies: string;
   avoid: string;
+  include: string;
 };
 
 type Ingredient = {
@@ -44,6 +45,9 @@ type Recipe = {
   steps: string[];
   stepsVersion?: number;
   childNote?: string;
+  requestedFoods?: string[];
+  requestedException?: boolean;
+  requestedExceptionReason?: string;
   source?: "ai" | "fallback";
 };
 
@@ -72,6 +76,7 @@ const DEFAULT_CONFIG: Config = {
   otherTool: "",
   allergies: "",
   avoid: "",
+  include: "",
 };
 
 const TOOLS = ["Sartén", "Olla rápida", "Thermomix", "Airfryer", "Horno", "Microondas"];
@@ -229,6 +234,48 @@ function restrictionTerms(restrictions: string) {
     .split(/[,;\n]|\s+y\s+/)
     .map(cleanFoodText)
     .filter((term) => term.length > 2);
+}
+
+function requestedFoodTerms(value: string) {
+  const unique = new Map<string, string>();
+  value.split(/[,;\n]+/).map((term) => term.trim()).filter(Boolean).forEach((term) => {
+    const key = cleanFoodText(term);
+    if (key && !unique.has(key)) unique.set(key, term);
+  });
+  return [...unique.values()];
+}
+
+const CLIENT_ALLERGEN_GROUPS: Record<string, string[]> = {
+  lactosa: ["leche", "queso", "yogur", "nata", "mantequilla", "lactosa"],
+  leche: ["leche", "queso", "yogur", "nata", "mantequilla", "lactosa"],
+  gluten: ["trigo", "cebada", "centeno", "espelta", "pan", "pasta", "cuscús", "harina", "gluten"],
+  huevo: ["huevo", "huevos", "mayonesa"],
+  pescado: ["pescado", "salmón", "merluza", "atún", "bacalao", "sardina", "anchoa"],
+  marisco: ["marisco", "gamba", "langostino", "camarón", "mejillón", "almeja", "calamar", "pulpo"],
+  soja: ["soja", "tofu", "edamame", "tempeh", "miso"],
+  sésamo: ["sésamo", "tahini"],
+  cacahuete: ["cacahuete", "maní"],
+  "frutos secos": ["almendra", "nuez", "avellana", "pistacho", "anacardo", "castaña"],
+};
+
+function expandedClientRestrictions(config: Config) {
+  const direct = restrictionTerms(`${config.allergies},${config.avoid}`);
+  const expanded = new Set(direct);
+  direct.forEach((term) => Object.entries(CLIENT_ALLERGEN_GROUPS).forEach(([group, members]) => {
+    if (foodMatchesTerm(group, term) || members.some((member) => foodMatchesTerm(member, term))) {
+      members.forEach((member) => expanded.add(member));
+    }
+  }));
+  return [...expanded];
+}
+
+function requestedFoodConflicts(config: Config) {
+  const restrictions = expandedClientRestrictions(config);
+  return requestedFoodTerms(config.include).filter((food) => restrictions.some((term) => foodMatchesTerm(food, term)));
+}
+
+function recipeContainsFood(recipe: Recipe, food: string) {
+  return recipe.ingredients.some((ingredient) => ingredient.amount > 0 && foodMatchesTerm(ingredient.name, food));
 }
 
 function ingredientIsRestricted(name: string, category: string, restrictions: string) {
@@ -656,7 +703,10 @@ export default function Home() {
   const startGeneration = () => { if (recipes.length || shopping.length) setConfirmNew(true); else { setStep(1); setWizardOpen(true); } };
   const openWizardAfterConfirm = () => { setConfirmNew(false); setStep(1); setWizardOpen(true); };
   const finishGeneration = async () => {
-    if (config.lunches + config.dinners === 0 || config.tools.length + Number(Boolean(config.otherTool.trim())) === 0) return;
+    if (config.lunches + config.dinners === 0
+      || config.tools.length + Number(Boolean(config.otherTool.trim())) === 0
+      || requestedFoodTerms(config.include).length > 3
+      || requestedFoodConflicts(config).length > 0) return;
     setGenerating(true);
     try {
       const nextRecipes = await requestRecipes(config, { favorites });
@@ -668,7 +718,7 @@ export default function Home() {
       setWizardOpen(false); setSection("recetas");
       setToast("Tu nuevo menú con IA está listo");
     } catch (error) {
-      if (error instanceof RecipeGenerationError && ["NO_DISTINCT_ALTERNATIVE", "ACCESS_REQUIRED", "ACCESS_DENIED"].includes(error.code ?? "")) {
+      if (error instanceof RecipeGenerationError && ["NO_DISTINCT_ALTERNATIVE", "ACCESS_REQUIRED", "ACCESS_DENIED", "INCLUDE_CONFLICT", "UNSAFE_FOR_CHILDREN"].includes(error.code ?? "")) {
         setGenerationWarning(error.message);
         return;
       }
@@ -678,6 +728,11 @@ export default function Home() {
     }
   };
   const chooseBasicMenu = () => {
+    if (requestedFoodTerms(config.include).length) {
+      setAiFailure(null);
+      setGenerationWarning("El generador básico no puede garantizar los alimentos que has pedido incluir. Reintenta con la IA o elimina ese campo para usar el generador básico.");
+      return;
+    }
     const nextRecipes = generateRecipes(config, replaceNonce, favorites);
     if (nextRecipes.length < config.lunches + config.dinners) {
       setGenerationWarning("El generador básico tampoco encuentra una combinación suficientemente distinta. Amplía el tiempo, los utensilios o los alimentos permitidos.");
@@ -694,10 +749,15 @@ export default function Home() {
     setToast(exists ? "Eliminada de favoritas" : "Guardada en favoritas");
   };
   const replaceRecipe = async (recipe: Recipe) => {
+    const remainingRecipes = recipes.filter((item) => item.id !== recipe.id);
+    const foodsNeededInReplacement = requestedFoodTerms(config.include).filter((food) =>
+      !remainingRecipes.some((item) => recipeContainsFood(item, food)),
+    );
     const replacementConfig: Config = {
       ...config,
       lunches: recipe.kind === "Comida" ? 1 : 0,
       dinners: recipe.kind === "Cena" ? 1 : 0,
+      include: foodsNeededInReplacement.join(", "),
     };
     let replacement: Recipe | undefined;
     try {
@@ -720,6 +780,15 @@ export default function Home() {
     setToast("Receta sustituida con IA y compra actualizada");
   };
   const chooseBasicReplacement = (recipe: Recipe) => {
+    const remainingRecipes = recipes.filter((item) => item.id !== recipe.id);
+    const mustPreserveRequestedFood = requestedFoodTerms(config.include).some((food) =>
+      !remainingRecipes.some((item) => recipeContainsFood(item, food)),
+    );
+    if (mustPreserveRequestedFood) {
+      setAiFailure(null);
+      setGenerationWarning("El generador básico no puede garantizar que la receta sustituta conserve el alimento solicitado. Reintenta el cambio con IA.");
+      return;
+    }
     const index = recipes.filter((item) => item.kind === recipe.kind).findIndex((item) => item.id === recipe.id);
     const restrictions = `${config.allergies},${config.avoid}`;
     const otherRecipes = [...favorites, ...recipes.filter((item) => item.id !== recipe.id), recipe];
@@ -783,14 +852,14 @@ export default function Home() {
     {wizardOpen && <Wizard step={step} setStep={setStep} config={config} setConfig={setConfig} onClose={() => setWizardOpen(false)} onFinish={finishGeneration} generating={generating} />}
     {confirmNew && <ConfirmModal onCancel={() => setConfirmNew(false)} onConfirm={openWizardAfterConfirm} />}
     {generationWarning && <ConstraintWarningModal message={generationWarning} onClose={() => setGenerationWarning("")} />}
-    {aiFailure && <AiFailureModal hasExistingRecipes={recipes.length > 0} onCancel={() => setAiFailure(null)} onRetry={retryAiGeneration} onUseBasic={chooseBasicGenerator} />}
+    {aiFailure && <AiFailureModal hasExistingRecipes={recipes.length > 0} basicUnavailable={requestedFoodTerms(config.include).length > 0} onCancel={() => setAiFailure(null)} onRetry={retryAiGeneration} onUseBasic={chooseBasicGenerator} />}
     {selectedRecipe && <RecipeDetail recipe={selectedRecipe} favorite={favorites.some((favorite) => favorite.id === selectedRecipe.id)} cookStep={cookStep} setCookStep={setCookStep} onClose={() => { setSelectedRecipe(null); setCookStep(null); }} onFavorite={() => toggleFavorite(selectedRecipe)} onReplace={() => replaceRecipe(selectedRecipe)} canReplace={recipes.some((recipe) => recipe.id === selectedRecipe.id)} />}
     {toast && <div className="toast" role="status">✓ {toast}</div>}
   </main>;
 }
 
 function RecipeCard({ recipe, favorite, onOpen, onFavorite }: { recipe: Recipe; favorite: boolean; onOpen: () => void; onFavorite: () => void }) {
-  return <article className="recipe-card"><div className={`recipe-cover ${recipe.mode === "Familiar" ? "family" : "lowcarb"}`}><span className="meal-label">{recipe.kind}</span><button className={favorite ? "favorite active" : "favorite"} onClick={onFavorite} aria-label={favorite ? "Quitar de favoritas" : "Añadir a favoritas"}>{favorite ? "♥" : "♡"}</button><div className="food-emoji">{recipe.emoji}</div></div><div className="recipe-body"><div className="recipe-tags"><span>{recipe.mode}</span><span>{recipe.difficulty}</span></div><h2>{recipe.title}</h2><div className="recipe-meta"><span>◷ {recipe.totalMinutes} min</span><span>♙ {recipe.servings} raciones</span><span>⚡ {recipe.calories} kcal</span></div><button onClick={onOpen}>Ver receta <span>→</span></button></div></article>;
+  return <article className="recipe-card"><div className={`recipe-cover ${recipe.mode === "Familiar" ? "family" : "lowcarb"}`}><span className="meal-label">{recipe.kind}</span><button className={favorite ? "favorite active" : "favorite"} onClick={onFavorite} aria-label={favorite ? "Quitar de favoritas" : "Añadir a favoritas"}>{favorite ? "♥" : "♡"}</button><div className="food-emoji">{recipe.emoji}</div></div><div className="recipe-body"><div className="recipe-tags"><span>{recipe.mode}</span><span>{recipe.difficulty}</span>{recipe.requestedException && <span className="exception-tag">Excepción solicitada</span>}</div><h2>{recipe.title}</h2>{recipe.requestedException && <p className="recipe-exception">⚠ {recipe.requestedExceptionReason}</p>}<div className="recipe-meta"><span>◷ {recipe.totalMinutes} min</span><span>♙ {recipe.servings} raciones</span><span>⚡ {recipe.calories} kcal</span></div><button onClick={onOpen}>Ver receta <span>→</span></button></div></article>;
 }
 
 function EmptyState({ icon, title, text, action, actionLabel = "Generar recetas" }: { icon: string; title: string; text: string; action: () => void; actionLabel?: string }) {
@@ -802,17 +871,25 @@ function ConfirmModal({ onCancel, onConfirm }: { onCancel: () => void; onConfirm
 }
 
 function ConstraintWarningModal({ message, onClose }: { message: string; onClose: () => void }) {
-  return <div className="modal-backdrop" role="alertdialog" aria-modal="true" aria-labelledby="constraint-warning-title"><div className="confirm-card ai-failure-card"><button className="close-button" onClick={onClose} aria-label="Cerrar">×</button><div className="confirm-icon">≠</div><h2 id="constraint-warning-title">No hay una alternativa realmente distinta</h2><p>{message}</p><div className="safe-note">Tus recetas actuales y tus favoritas siguen sin cambios.</div><div className="modal-actions"><button className="primary-button compact" onClick={onClose}>Revisar preferencias</button></div></div></div>;
+  return <div className="modal-backdrop" role="alertdialog" aria-modal="true" aria-labelledby="constraint-warning-title"><div className="confirm-card ai-failure-card"><button className="close-button" onClick={onClose} aria-label="Cerrar">×</button><div className="confirm-icon">≠</div><h2 id="constraint-warning-title">Revisa tus preferencias</h2><p>{message}</p><div className="safe-note">Tus recetas actuales y tus favoritas siguen sin cambios.</div><div className="modal-actions"><button className="primary-button compact" onClick={onClose}>Revisar preferencias</button></div></div></div>;
 }
 
-function AiFailureModal({ hasExistingRecipes, onCancel, onRetry, onUseBasic }: { hasExistingRecipes: boolean; onCancel: () => void; onRetry: () => void; onUseBasic: () => void }) {
-  return <div className="modal-backdrop" role="alertdialog" aria-modal="true" aria-labelledby="ai-failure-title"><div className="confirm-card ai-failure-card"><button className="close-button" onClick={onCancel} aria-label="Cerrar">×</button><div className="confirm-icon">!</div><h2 id="ai-failure-title">No hemos podido conectar con la IA</h2><p>{hasExistingRecipes ? "Tus recetas actuales y tu lista de la compra se conservan sin cambios." : "No se ha cambiado ninguna receta."} Puedes volver a intentarlo ahora.</p><div className="safe-note">No se ha activado ningún generador de respaldo automáticamente.</div><div className="failure-actions"><button className="primary-button compact" onClick={onRetry}>Reintentar</button><button className="outline-button" onClick={onUseBasic}>Usar generador básico</button><button className="secondary-button" onClick={onCancel}>Volver sin cambios</button></div><small className="basic-generator-note">El generador básico es opcional y crea recetas locales más sencillas.</small></div></div>;
+function AiFailureModal({ hasExistingRecipes, basicUnavailable, onCancel, onRetry, onUseBasic }: { hasExistingRecipes: boolean; basicUnavailable: boolean; onCancel: () => void; onRetry: () => void; onUseBasic: () => void }) {
+  return <div className="modal-backdrop" role="alertdialog" aria-modal="true" aria-labelledby="ai-failure-title"><div className="confirm-card ai-failure-card"><button className="close-button" onClick={onCancel} aria-label="Cerrar">×</button><div className="confirm-icon">!</div><h2 id="ai-failure-title">No hemos podido conectar con la IA</h2><p>{hasExistingRecipes ? "Tus recetas actuales y tu lista de la compra se conservan sin cambios." : "No se ha cambiado ninguna receta."} Puedes volver a intentarlo ahora.</p><div className="safe-note">No se ha activado ningún generador de respaldo automáticamente.</div><div className="failure-actions"><button className="primary-button compact" onClick={onRetry}>Reintentar</button>{!basicUnavailable && <button className="outline-button" onClick={onUseBasic}>Usar generador básico</button>}<button className="secondary-button" onClick={onCancel}>Volver sin cambios</button></div><small className="basic-generator-note">{basicUnavailable ? "El generador básico no puede garantizar los alimentos solicitados." : "El generador básico es opcional y crea recetas locales más sencillas."}</small></div></div>;
 }
 
 function Wizard({ step, setStep, config, setConfig, onClose, onFinish, generating }: { step: number; setStep: (step: number) => void; config: Config; setConfig: (config: Config) => void; onClose: () => void; onFinish: () => void; generating: boolean }) {
   const totalRecipes = config.lunches + config.dinners;
   const canContinue = step !== 2 || totalRecipes > 0;
-  const canFinish = config.tools.length + Number(Boolean(config.otherTool.trim())) > 0;
+  const requestedFoods = requestedFoodTerms(config.include);
+  const includeConflicts = requestedFoodConflicts(config);
+  const unsafeForChildren = config.children > 0
+    ? requestedFoods.filter((food) => ["alcohol", "vino", "cerveza", "licor", "ron", "brandy", "whisky"].some((term) => foodMatchesTerm(food, term)))
+    : [];
+  const canFinish = config.tools.length + Number(Boolean(config.otherTool.trim())) > 0
+    && requestedFoods.length <= 3
+    && includeConflicts.length === 0
+    && unsafeForChildren.length === 0;
   const toggleTool = (tool: string) => setConfig({ ...config, tools: config.tools.includes(tool) ? config.tools.filter((item) => item !== tool) : [...config.tools, tool] });
   return <div className="wizard-screen"><header><button className="back-button" onClick={step === 1 ? onClose : () => setStep(step - 1)}>←</button><div><strong>Generar recetas</strong><small>Paso {step} de 5</small></div><button className="close-button" onClick={onClose}>×</button></header><div className="progress"><span style={{ width: `${step * 20}%` }} /></div><div className="wizard-content">
     {generating ? <div className="generating"><div className="spinner">🥗</div><h1>Preparando tus recetas…</h1><p>Estamos combinando opciones sencillas y equilibradas.</p><div className="generation-steps"><span className="done">✓ Preferencias revisadas</span><span className="done">✓ Recetas seleccionadas</span><span>○ Creando la lista de la compra</span></div></div> : <>
@@ -820,7 +897,7 @@ function Wizard({ step, setStep, config, setConfig, onClose, onFinish, generatin
       {step === 2 && <div className="wizard-step"><span className="step-emoji">🍽️</span><h1>¿Cuántas recetas necesitas?</h1><p>Elige de 0 a 5. No asignaremos días a las recetas.</p><Counter label="Comidas" value={config.lunches} onChange={(lunches) => setConfig({ ...config, lunches })}/><Counter label="Cenas" value={config.dinners} onChange={(dinners) => setConfig({ ...config, dinners })}/>{totalRecipes === 0 ? <div className="error-note">Selecciona al menos una comida o cena.</div> : <div className="selection-total"><strong>{totalRecipes}</strong><span>recetas en total</span></div>}</div>}
       {step === 3 && <div className="wizard-step"><span className="step-emoji">⏱️</span><h1>¿Cuánto tiempo quieres cocinar?</h1><p>El límite se aplicará al tiempo total de cada receta.</p><div className="time-choices"><TimeChoice active={config.timeBand === "quick"} onClick={() => setConfig({ ...config, timeBand: "quick" })} title="Hasta 30 minutos" detail="Recetas rápidas para el día a día"/><TimeChoice active={config.timeBand === "medium"} onClick={() => setConfig({ ...config, timeBand: "medium" })} title="Entre 30 y 60 minutos" detail="Algo más de elaboración, sin complicarse"/><TimeChoice active={config.timeBand === "slow"} onClick={() => setConfig({ ...config, timeBand: "slow" })} title="Entre 1 y 2 horas" detail="Para cocinar con más calma"/></div><div className="info-note">Cada receta mostrará el tiempo activo y el tiempo total.</div></div>}
       {step === 4 && <div className="wizard-step"><span className="step-emoji">🍳</span><h1>¿Qué tienes en tu cocina?</h1><p>Usaremos como máximo dos utensilios principales por receta.</p><div className="tool-grid">{TOOLS.map((tool) => <Choice key={tool} active={config.tools.includes(tool)} onClick={() => toggleTool(tool)} title={tool} check/>)}</div><FieldLabel text="Otro utensilio"/><input className="text-input" value={config.otherTool} onChange={(event) => setConfig({ ...config, otherTool: event.target.value })} placeholder="Ej. plancha eléctrica"/>{!canFinish && <div className="error-note">Selecciona al menos un utensilio disponible.</div>}</div>}
-      {step === 5 && <div className="wizard-step"><span className="step-emoji">🌿</span><h1>Últimos detalles</h1><p>Déjalos vacíos si no tienes ninguna restricción.</p><FieldLabel text="Alergias o intolerancias"/><textarea className="text-input textarea" value={config.allergies} onChange={(event) => setConfig({ ...config, allergies: event.target.value })} placeholder="Ej. lactosa, frutos secos…"/><FieldLabel text="Alimentos a evitar"/><textarea className="text-input textarea" value={config.avoid} onChange={(event) => setConfig({ ...config, avoid: event.target.value })} placeholder="Ej. champiñones, cebolla…"/><div className="summary-card"><strong>Tu selección</strong><span>{config.adults} {config.adults === 1 ? "adulto" : "adultos"}{config.children ? ` · ${config.children} ${config.children === 1 ? "niño" : "niños"}` : ""}</span><span>{config.lunches} comidas · {config.dinners} cenas</span><span>{config.timeBand === "quick" ? "Hasta 30 min" : config.timeBand === "medium" ? "Entre 30 y 60 min" : "Entre 1 y 2 horas"}</span>{config.allergies.trim() && <span>Alergias: {config.allergies.trim()}</span>}{config.avoid.trim() && <span>Evitar: {config.avoid.trim()}</span>}</div><div className="demo-note">Las recetas se generan con IA. Si no podemos conectar, conservaremos tus recetas y podrás reintentar o elegir voluntariamente el generador básico.</div></div>}
+      {step === 5 && <div className="wizard-step"><span className="step-emoji">🌿</span><h1>Últimos detalles</h1><p>Indica restricciones o ingredientes que quieras aprovechar.</p><FieldLabel text="Alergias o intolerancias"/><textarea className="text-input textarea" value={config.allergies} onChange={(event) => setConfig({ ...config, allergies: event.target.value })} placeholder="Ej. lactosa, frutos secos…"/><FieldLabel text="Alimentos a evitar"/><textarea className="text-input textarea" value={config.avoid} onChange={(event) => setConfig({ ...config, avoid: event.target.value })} placeholder="Ej. champiñones, cebolla…"/><FieldLabel text="Alimentos a incluir" hint="Opcional · máximo 3"/><textarea className="text-input textarea" value={config.include} onChange={(event) => setConfig({ ...config, include: event.target.value })} placeholder="Ej. boniato, arroz basmati…"/><div className="include-note">Los incluiremos en una cantidad útil en al menos una receta, no necesariamente en todas.</div>{requestedFoods.length > 3 && <div className="error-note">Introduce como máximo tres alimentos, separados por comas.</div>}{includeConflicts.length > 0 && <div className="error-note">No podemos incluir {includeConflicts.join(", ")} porque también aparece en alergias o alimentos a evitar.</div>}{unsafeForChildren.length > 0 && <div className="error-note">No podemos incluir {unsafeForChildren.join(", ")} en recetas destinadas a niños.</div>}<div className="summary-card"><strong>Tu selección</strong><span>{config.adults} {config.adults === 1 ? "adulto" : "adultos"}{config.children ? ` · ${config.children} ${config.children === 1 ? "niño" : "niños"}` : ""}</span><span>{config.lunches} comidas · {config.dinners} cenas</span><span>{config.timeBand === "quick" ? "Hasta 30 min" : config.timeBand === "medium" ? "Entre 30 y 60 min" : "Entre 1 y 2 horas"}</span>{config.allergies.trim() && <span>Alergias: {config.allergies.trim()}</span>}{config.avoid.trim() && <span>Evitar: {config.avoid.trim()}</span>}{requestedFoods.length > 0 && <span>Incluir: {requestedFoods.join(", ")}</span>}</div><div className="demo-note">Si un alimento solicitado impide mantener el objetivo nutricional, la receta se generará con un aviso visible. Las alergias y los alimentos a evitar siempre tienen prioridad.</div></div>}
     </>}
   </div>{!generating && <footer><span>{step < 5 ? "Puedes cambiarlo más tarde" : `${totalRecipes} recetas listas para generar`}</span>{step < 5 ? <button className="primary-button compact" disabled={!canContinue || (step === 4 && !canFinish)} onClick={() => setStep(step + 1)}>Continuar →</button> : <button className="primary-button compact" disabled={!canFinish} onClick={onFinish}>Generar mis recetas ✦</button>}</footer>}</div>;
 }
@@ -832,5 +909,5 @@ function Counter({ label, value, onChange }: { label: string; value: number; onC
 
 function RecipeDetail({ recipe, favorite, cookStep, setCookStep, onClose, onFavorite, onReplace, canReplace }: { recipe: Recipe; favorite: boolean; cookStep: number | null; setCookStep: (step: number | null) => void; onClose: () => void; onFavorite: () => void; onReplace: () => void; canReplace: boolean }) {
   if (cookStep !== null) return <div className="detail-screen cook-mode"><header><button className="back-button" onClick={() => setCookStep(null)}>←</button><div><strong>Cocinar paso a paso</strong><small>{recipe.title}</small></div><button className="close-button" onClick={onClose}>×</button></header><div className="cook-content"><span className="cook-count">Paso {cookStep + 1} de {recipe.steps.length}</span><div className="cook-emoji">{recipe.emoji}</div><p>{recipe.steps[cookStep]}</p></div><footer><button className="secondary-button" disabled={cookStep === 0} onClick={() => setCookStep(Math.max(0, cookStep - 1))}>← Anterior</button><button className="primary-button compact" onClick={() => cookStep === recipe.steps.length - 1 ? setCookStep(null) : setCookStep(cookStep + 1)}>{cookStep === recipe.steps.length - 1 ? "Terminar ✓" : "Siguiente →"}</button></footer></div>;
-  return <div className="detail-screen"><header><button className="back-button" onClick={onClose}>←</button><div><strong>{recipe.kind}</strong><small>{recipe.mode}</small></div><button className={favorite ? "favorite detail-fav active" : "favorite detail-fav"} onClick={onFavorite}>{favorite ? "♥" : "♡"}</button></header><div className={`detail-hero ${recipe.mode === "Familiar" ? "family" : "lowcarb"}`}><span>{recipe.emoji}</span><div><div className="recipe-tags"><em>{recipe.kind}</em><em>{recipe.mode}</em></div><h1>{recipe.title}</h1><p>Una receta sencilla, sabrosa y pensada para tu selección.</p></div></div><div className="detail-content"><div className="stat-row"><div><small>Tiempo activo</small><strong>{recipe.activeMinutes} min</strong></div><div><small>Tiempo total</small><strong>{recipe.totalMinutes} min</strong></div><div><small>Raciones</small><strong>{recipe.servings}</strong></div><div><small>Dificultad</small><strong>{recipe.difficulty}</strong></div></div><section><h2>Información nutricional <small>por ración</small></h2><div className="nutrition-card"><div className="calories"><strong>{recipe.calories}</strong><span>kcal</span></div><div className="metric-list"><MetricBar label="Proteínas" value={recipe.protein} kind="protein"/><MetricBar label="Hidratos" value={recipe.carbs} kind="carbs"/></div></div></section><section><h2>Ingredientes</h2><ul className="ingredient-list">{recipe.ingredients.map((ingredient) => <li key={ingredient.name}><span>{ingredient.name}</span><strong>{ingredient.amount} {ingredient.unit}</strong></li>)}</ul></section>{recipe.childNote && <div className="child-note"><span>👧</span><div><strong>Adaptación infantil</strong><p>{recipe.childNote}</p></div></div>}<section><h2>Preparación</h2><ol className="steps-list">{recipe.steps.map((step, index) => <li key={step}><span>{index + 1}</span><p>{step}</p></li>)}</ol></section><div className="detail-actions"><button className="primary-button" onClick={() => setCookStep(0)}>Cocinar paso a paso →</button>{canReplace && <button className="secondary-button" onClick={onReplace}>↻ Cambiar esta receta</button>}</div><p className="nutrition-disclaimer">Valores nutricionales aproximados. Revisa siempre los ingredientes en caso de alergia o intolerancia.</p></div></div>;
+  return <div className="detail-screen"><header><button className="back-button" onClick={onClose}>←</button><div><strong>{recipe.kind}</strong><small>{recipe.mode}</small></div><button className={favorite ? "favorite detail-fav active" : "favorite detail-fav"} onClick={onFavorite}>{favorite ? "♥" : "♡"}</button></header><div className={`detail-hero ${recipe.mode === "Familiar" ? "family" : "lowcarb"}`}><span>{recipe.emoji}</span><div><div className="recipe-tags"><em>{recipe.kind}</em><em>{recipe.mode}</em>{recipe.requestedException && <em className="exception-tag">Excepción solicitada</em>}</div><h1>{recipe.title}</h1><p>Una receta sencilla, sabrosa y pensada para tu selección.</p></div></div><div className="detail-content"><div className="stat-row"><div><small>Tiempo activo</small><strong>{recipe.activeMinutes} min</strong></div><div><small>Tiempo total</small><strong>{recipe.totalMinutes} min</strong></div><div><small>Raciones</small><strong>{recipe.servings}</strong></div><div><small>Dificultad</small><strong>{recipe.difficulty}</strong></div></div>{recipe.requestedException && <div className="requested-exception-note"><span>⚠</span><div><strong>Excepción por alimento solicitado</strong><p>{recipe.requestedExceptionReason}</p></div></div>}<section><h2>Información nutricional <small>por ración</small></h2><div className="nutrition-card"><div className="calories"><strong>{recipe.calories}</strong><span>kcal</span></div><div className="metric-list"><MetricBar label="Proteínas" value={recipe.protein} kind="protein"/><MetricBar label="Hidratos" value={recipe.carbs} kind="carbs"/></div></div></section><section><h2>Ingredientes</h2><ul className="ingredient-list">{recipe.ingredients.map((ingredient) => <li key={ingredient.name}><span>{ingredient.name}</span><strong>{ingredient.amount} {ingredient.unit}</strong></li>)}</ul></section>{recipe.childNote && <div className="child-note"><span>👧</span><div><strong>Adaptación infantil</strong><p>{recipe.childNote}</p></div></div>}<section><h2>Preparación</h2><ol className="steps-list">{recipe.steps.map((step, index) => <li key={step}><span>{index + 1}</span><p>{step}</p></li>)}</ol></section><div className="detail-actions"><button className="primary-button" onClick={() => setCookStep(0)}>Cocinar paso a paso →</button>{canReplace && <button className="secondary-button" onClick={onReplace}>↻ Cambiar esta receta</button>}</div><p className="nutrition-disclaimer">Valores nutricionales aproximados. Revisa siempre los ingredientes en caso de alergia o intolerancia.</p></div></div>;
 }

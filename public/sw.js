@@ -1,4 +1,4 @@
-const CACHE_NAME = "nutricionapp-v2";
+const CACHE_NAME = "nutricionapp-v3";
 const APP_ROOT = new URL("./", self.registration.scope).href;
 const CORE_ASSETS = ["./", "manifest.webmanifest", "favicon.svg", "icon-192.png", "icon-512.png"]
   .map((path) => new URL(path, APP_ROOT).href);

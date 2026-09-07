@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { createRecipePdf, recipePdfFilename } from "../lib/recipe-pdf";
 
-type Section = "inicio" | "recetas" | "compra" | "favoritas";
+type Section = "inicio" | "recetas" | "calendario" | "compra" | "favoritas";
 type RecipeKind = "Comida" | "Cena";
 type TimeBand = "quick" | "medium" | "slow";
 
@@ -52,6 +53,8 @@ type Recipe = {
 };
 
 type ShoppingItem = Ingredient & { checked: boolean };
+type CalendarPlan = Record<string, Partial<Record<RecipeKind, Recipe>>>;
+type CalendarPicker = { recipe?: Recipe; dateKey?: string; kind?: RecipeKind };
 
 type RecipeSummary = {
   title: string;
@@ -107,6 +110,40 @@ const FAMILY_SIDES = [
   { name: "pasta integral", unit: "g", perAdult: 70, perChild: 55 },
   { name: "pan integral", unit: "g", perAdult: 50, perChild: 40 },
 ];
+
+function dateKey(date: Date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function addDays(date: Date, days: number) {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  next.setHours(12, 0, 0, 0);
+  return next;
+}
+
+function startOfWeek(date: Date) {
+  const next = new Date(date);
+  const day = next.getDay() || 7;
+  next.setDate(next.getDate() - day + 1);
+  next.setHours(12, 0, 0, 0);
+  return next;
+}
+
+function daysInWeek(weekStart: Date) {
+  return Array.from({ length: 7 }, (_, index) => addDays(weekStart, index));
+}
+
+function weekLabel(weekStart: Date) {
+  const end = addDays(weekStart, 6);
+  const sameMonth = weekStart.getMonth() === end.getMonth();
+  const first = weekStart.toLocaleDateString("es-ES", sameMonth ? { day: "numeric" } : { day: "numeric", month: "short" });
+  const last = end.toLocaleDateString("es-ES", { day: "numeric", month: "long", year: "numeric" });
+  return `${first} - ${last}`;
+}
 function normalize(value: string) {
   return value.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 }
@@ -535,6 +572,24 @@ function upgradeRecipeSteps(recipe: Recipe): Recipe {
   };
 }
 
+function upgradeCalendar(value: unknown): CalendarPlan {
+  if (!value || typeof value !== "object") return {};
+  const plan: CalendarPlan = {};
+  Object.entries(value as Record<string, unknown>).forEach(([day, slots]) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !slots || typeof slots !== "object") return;
+    const source = slots as Partial<Record<RecipeKind, unknown>>;
+    const upgraded: Partial<Record<RecipeKind, Recipe>> = {};
+    (["Comida", "Cena"] as RecipeKind[]).forEach((kind) => {
+      const recipe = source[kind];
+      if (recipe && typeof recipe === "object" && typeof (recipe as Recipe).id === "string" && Array.isArray((recipe as Recipe).ingredients)) {
+        upgraded[kind] = upgradeRecipeSteps(recipe as Recipe);
+      }
+    });
+    if (upgraded.Comida || upgraded.Cena) plan[day] = upgraded;
+  });
+  return plan;
+}
+
 function makeRecipe(kind: RecipeKind, index: number, config: Config, nonce = 0): Recipe {
   const seed = index + nonce * 3 + (kind === "Cena" ? 7 : 0);
   const family = config.children > 0;
@@ -675,6 +730,9 @@ export default function Home() {
   const [recipes, setRecipes] = useState<Recipe[]>([]);
   const [favorites, setFavorites] = useState<Recipe[]>([]);
   const [shopping, setShopping] = useState<ShoppingItem[]>([]);
+  const [calendar, setCalendar] = useState<CalendarPlan>({});
+  const [weekStart, setWeekStart] = useState(() => startOfWeek(new Date()));
+  const [calendarPicker, setCalendarPicker] = useState<CalendarPicker | null>(null);
   const [selectedRecipe, setSelectedRecipe] = useState<Recipe | null>(null);
   const [cookStep, setCookStep] = useState<number | null>(null);
   const [confirmNew, setConfirmNew] = useState(false);
@@ -683,6 +741,7 @@ export default function Home() {
   const [generationWarning, setGenerationWarning] = useState("");
   const [aiFailure, setAiFailure] = useState<{ action: "menu" } | { action: "replace"; recipeId: string } | null>(null);
   const [replaceNonce, setReplaceNonce] = useState(1);
+  const [sharingRecipeId, setSharingRecipeId] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
 
   useEffect(() => {
@@ -691,8 +750,10 @@ export default function Home() {
         const savedFavorites = localStorage.getItem("nutricionapp-favorites");
         const savedRecipes = localStorage.getItem("nutricionapp-recipes");
         const savedConfig = localStorage.getItem("nutricionapp-config");
+        const savedCalendar = localStorage.getItem("nutricionapp-calendar");
         if (savedFavorites) setFavorites((JSON.parse(savedFavorites) as Recipe[]).map(upgradeRecipeSteps));
         if (savedConfig) setConfig({ ...DEFAULT_CONFIG, ...JSON.parse(savedConfig) });
+        if (savedCalendar) setCalendar(upgradeCalendar(JSON.parse(savedCalendar)));
         if (savedRecipes) {
           const parsed = (JSON.parse(savedRecipes) as Recipe[]).map(upgradeRecipeSteps);
           setRecipes(parsed);
@@ -710,9 +771,15 @@ export default function Home() {
   useEffect(() => { if (hydrated) localStorage.setItem("nutricionapp-favorites", JSON.stringify(favorites)); }, [favorites, hydrated]);
   useEffect(() => { if (hydrated) localStorage.setItem("nutricionapp-recipes", JSON.stringify(recipes)); }, [recipes, hydrated]);
   useEffect(() => { if (hydrated) localStorage.setItem("nutricionapp-config", JSON.stringify(config)); }, [config, hydrated]);
+  useEffect(() => { if (hydrated) localStorage.setItem("nutricionapp-calendar", JSON.stringify(calendar)); }, [calendar, hydrated]);
   useEffect(() => { if (!toast) return; const timer = window.setTimeout(() => setToast(""), 2400); return () => window.clearTimeout(timer); }, [toast]);
 
   const groupedShopping = useMemo(() => CATEGORIES.map((category) => ({ category, items: shopping.filter((item) => item.category === category) })).filter((group) => group.items.length), [shopping]);
+  const recipePool = useMemo(() => {
+    const unique = new Map<string, Recipe>();
+    [...recipes, ...favorites].forEach((recipe) => unique.set(recipe.id, recipe));
+    return [...unique.values()];
+  }, [recipes, favorites]);
   const startGeneration = () => { if (recipes.length || shopping.length) setConfirmNew(true); else { setStep(1); setWizardOpen(true); } };
   const openWizardAfterConfirm = () => { setConfirmNew(false); setStep(1); setWizardOpen(true); };
   const finishGeneration = async () => {
@@ -844,9 +911,60 @@ export default function Home() {
   const shoppingText = () => groupedShopping.map((group) => [group.category.toUpperCase(), ...group.items.map((item) => `${item.checked ? "✓" : "☐"} ${item.amount} ${item.unit} de ${item.name}`)].join("\n")).join("\n\n");
   const copyShopping = async () => { await navigator.clipboard.writeText(shoppingText()); setToast("Lista copiada"); };
   const shareShopping = async () => { if (navigator.share) await navigator.share({ title: "Lista de la compra · NUTRICIONAPP", text: shoppingText() }); else await copyShopping(); };
+  const assignRecipe = (day: string, kind: RecipeKind, recipe: Recipe) => {
+    setCalendar((current) => ({ ...current, [day]: { ...current[day], [kind]: { ...recipe } } }));
+    setCalendarPicker(null);
+    setToast(`${recipe.title} añadida al calendario`);
+  };
+  const removeCalendarRecipe = (day: string, kind: RecipeKind) => {
+    setCalendar((current) => {
+      const next = { ...current };
+      const slots = { ...next[day] };
+      delete slots[kind];
+      if (slots.Comida || slots.Cena) next[day] = slots;
+      else delete next[day];
+      return next;
+    });
+    setToast("Receta eliminada del calendario");
+  };
+  const downloadRecipePdf = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  const shareRecipePdf = async (recipe: Recipe) => {
+    setSharingRecipeId(recipe.id);
+    let blob: Blob | null = null;
+    try {
+      blob = createRecipePdf(recipe);
+      const filename = recipePdfFilename(recipe);
+      const file = new File([blob], filename, { type: "application/pdf" });
+      if (navigator.share && navigator.canShare?.({ files: [file] })) {
+        await navigator.share({ title: recipe.title, text: `Receta de ${recipe.title}`, files: [file] });
+        setToast("Receta compartida en PDF");
+      } else {
+        downloadRecipePdf(blob, filename);
+        setToast("PDF descargado; ya puedes compartirlo");
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      if (blob) {
+        downloadRecipePdf(blob, recipePdfFilename(recipe));
+        setToast("No se pudo abrir Compartir; el PDF se ha descargado");
+      } else {
+        setToast("No se ha podido crear el PDF");
+      }
+    } finally {
+      setSharingRecipeId(null);
+    }
+  };
   const navItems: { key: Section; icon: string; label: string }[] = [
     { key: "inicio", icon: "⌂", label: "Inicio" }, { key: "recetas", icon: "▤", label: "Recetas" },
-    { key: "compra", icon: "✓", label: "Compra" }, { key: "favoritas", icon: "♡", label: "Favoritas" },
+    { key: "calendario", icon: "□", label: "Calendario" }, { key: "compra", icon: "✓", label: "Compra" },
+    { key: "favoritas", icon: "♡", label: "Favoritas" },
   ];
 
   return <main className="app-shell">
@@ -855,9 +973,10 @@ export default function Home() {
       {section === "inicio" && <section className="home-view">
         <div className="hero-card"><div className="hero-copy"><span className="eyebrow">TU MENÚ, A TU MANERA</span><h1>Recetas sencillas para comer mejor.</h1><p>Elige tus necesidades y prepara en minutos un menú equilibrado con su lista de la compra.</p><button className="primary-button light" onClick={startGeneration}>Generar recetas <span>→</span></button></div><div className="hero-plate" aria-hidden="true"><span>🥬</span><span>🍅</span><span>🥑</span><span>🍗</span></div></div>
         {recipes.length > 0 ? <div className="current-plan"><div><span className="eyebrow dark">TU SELECCIÓN ACTUAL</span><h2>{recipes.length} recetas listas para cocinar</h2><p>{recipes.filter((recipe) => recipe.kind === "Comida").length} comidas · {recipes.filter((recipe) => recipe.kind === "Cena").length} cenas · {recipes[0]?.servings} raciones</p></div><button className="outline-button" onClick={() => setSection("recetas")}>Ver recetas</button></div> : <div className="empty-welcome"><span>🥣</span><div><strong>Aún no tienes recetas</strong><p>Genera tu primera selección y aparecerá aquí.</p></div></div>}
-        <div className="feature-grid"><button onClick={() => setSection("recetas")}><span>🍲</span><strong>Recetas claras</strong><small>Ingredientes y pasos sencillos</small></button><button onClick={() => setSection("compra")}><span>🧺</span><strong>Compra ordenada</strong><small>Todo agrupado por secciones</small></button><button onClick={() => setSection("favoritas")}><span>♥</span><strong>Tus favoritas</strong><small>Siempre a mano en este móvil</small></button></div>
+        <div className="feature-grid"><button onClick={() => setSection("recetas")}><span>🍲</span><strong>Recetas claras</strong><small>Ingredientes y pasos sencillos</small></button><button onClick={() => setSection("calendario")}><span>▦</span><strong>Semana organizada</strong><small>Comidas y cenas en su día</small></button><button onClick={() => setSection("compra")}><span>🧺</span><strong>Compra ordenada</strong><small>Todo agrupado por secciones</small></button><button onClick={() => setSection("favoritas")}><span>♥</span><strong>Tus favoritas</strong><small>Siempre a mano en este móvil</small></button></div>
       </section>}
       {section === "recetas" && <section className="section-view"><div className="section-heading"><div><span className="eyebrow dark">TU SELECCIÓN</span><h1>Recetas generadas</h1><p>Guarda tus preferidas o cambia una receta sin empezar de nuevo.</p></div><button className="primary-button compact" onClick={startGeneration}>+ Generar nuevas</button></div>{recipes.length ? <div className="recipe-grid">{recipes.map((recipe) => <RecipeCard key={recipe.id} recipe={recipe} favorite={favorites.some((favorite) => favorite.id === recipe.id)} onOpen={() => setSelectedRecipe(recipe)} onFavorite={() => toggleFavorite(recipe)} />)}</div> : <EmptyState icon="🍽️" title="No hay recetas todavía" text="Genera una selección para comenzar." action={startGeneration} />}</section>}
+      {section === "calendario" && <CalendarView weekStart={weekStart} calendar={calendar} onPrevious={() => setWeekStart((current) => addDays(current, -7))} onNext={() => setWeekStart((current) => addDays(current, 7))} onToday={() => setWeekStart(startOfWeek(new Date()))} onPick={(day, kind) => setCalendarPicker({ dateKey: day, kind })} onOpen={setSelectedRecipe} onRemove={removeCalendarRecipe} />}
       {section === "compra" && <section className="section-view shopping-view"><div className="section-heading"><div><span className="eyebrow dark">TODO LO NECESARIO</span><h1>Lista de la compra</h1><p>Los básicos de despensa y las especias comunes no están incluidos.</p></div></div>{shopping.length ? <><div className="shopping-actions no-print"><button onClick={copyShopping}>▣ Copiar</button><button onClick={shareShopping}>↗ Compartir</button><button onClick={() => window.print()}>⇩ Descargar PDF</button></div><div className="shopping-paper"><div className="print-header"><span className="brand-mark small">N</span><div><strong>NUTRICIONAPP</strong><small>Mi lista de la compra</small></div></div>{groupedShopping.map((group) => <div className="shopping-group" key={group.category}><h2>{group.category}</h2>{group.items.map((item) => <label key={`${item.name}-${item.unit}`}><input type="checkbox" checked={item.checked} onChange={() => setShopping(shopping.map((current) => current.name === item.name && current.unit === item.unit ? { ...current, checked: !current.checked } : current))} /><span className="checkmark"/><span>{item.name}</span><strong>{item.amount} {item.unit}</strong></label>)}</div>)}<div className="shopping-note">Hecho con cariño para comer mejor cada día.</div></div></> : <EmptyState icon="🧺" title="Tu lista está vacía" text="Se creará automáticamente al generar recetas." action={startGeneration} />}</section>}
       {section === "favoritas" && <section className="section-view"><div className="section-heading"><div><span className="eyebrow dark">TU RECETARIO</span><h1>Recetas favoritas</h1><p>Se guardan en este dispositivo aunque generes un nuevo menú.</p></div></div>{favorites.length ? <div className="recipe-grid">{favorites.map((recipe) => <RecipeCard key={recipe.id} recipe={recipe} favorite onOpen={() => setSelectedRecipe(recipe)} onFavorite={() => toggleFavorite(recipe)} />)}</div> : <EmptyState icon="♡" title="Todavía no tienes favoritas" text="Pulsa el corazón de una receta para conservarla." action={() => setSection("recetas")} actionLabel="Ver recetas" />}</section>}
     </div>
@@ -866,9 +985,51 @@ export default function Home() {
     {confirmNew && <ConfirmModal onCancel={() => setConfirmNew(false)} onConfirm={openWizardAfterConfirm} />}
     {generationWarning && <ConstraintWarningModal message={generationWarning} onClose={() => setGenerationWarning("")} />}
     {aiFailure && <AiFailureModal hasExistingRecipes={recipes.length > 0} basicUnavailable={requestedFoodTerms(config.include).length > 0} onCancel={() => setAiFailure(null)} onRetry={retryAiGeneration} onUseBasic={chooseBasicGenerator} />}
-    {selectedRecipe && <RecipeDetail recipe={selectedRecipe} favorite={favorites.some((favorite) => favorite.id === selectedRecipe.id)} cookStep={cookStep} setCookStep={setCookStep} onClose={() => { setSelectedRecipe(null); setCookStep(null); }} onFavorite={() => toggleFavorite(selectedRecipe)} onReplace={() => replaceRecipe(selectedRecipe)} canReplace={recipes.some((recipe) => recipe.id === selectedRecipe.id)} />}
+    {calendarPicker && <ScheduleModal picker={calendarPicker} weekStart={weekStart} calendar={calendar} recipes={recipePool} onAssign={assignRecipe} onClose={() => setCalendarPicker(null)} onBrowseRecipes={() => { setCalendarPicker(null); setSection("recetas"); }} />}
+    {selectedRecipe && <RecipeDetail recipe={selectedRecipe} favorite={favorites.some((favorite) => favorite.id === selectedRecipe.id)} cookStep={cookStep} setCookStep={setCookStep} onClose={() => { setSelectedRecipe(null); setCookStep(null); }} onFavorite={() => toggleFavorite(selectedRecipe)} onReplace={() => replaceRecipe(selectedRecipe)} onSchedule={() => setCalendarPicker({ recipe: selectedRecipe })} onShare={() => void shareRecipePdf(selectedRecipe)} sharing={sharingRecipeId === selectedRecipe.id} canReplace={recipes.some((recipe) => recipe.id === selectedRecipe.id)} />}
     {toast && <div className="toast" role="status">✓ {toast}</div>}
   </main>;
+}
+
+function CalendarView({ weekStart, calendar, onPrevious, onNext, onToday, onPick, onOpen, onRemove }: {
+  weekStart: Date;
+  calendar: CalendarPlan;
+  onPrevious: () => void;
+  onNext: () => void;
+  onToday: () => void;
+  onPick: (day: string, kind: RecipeKind) => void;
+  onOpen: (recipe: Recipe) => void;
+  onRemove: (day: string, kind: RecipeKind) => void;
+}) {
+  const today = dateKey(new Date());
+  const days = daysInWeek(weekStart);
+  return <section className="section-view calendar-view"><div className="calendar-heading"><div><span className="eyebrow dark">PLAN SEMANAL</span><h1>Calendario</h1><p>{weekLabel(weekStart)}</p></div><div className="calendar-controls"><button onClick={onPrevious} aria-label="Semana anterior">←</button><button className="today-button" onClick={onToday}>Hoy</button><button onClick={onNext} aria-label="Semana siguiente">→</button></div></div><div className="calendar-grid">{days.map((day) => {
+    const key = dateKey(day);
+    return <article className={`calendar-day ${key === today ? "today" : ""}`} key={key}><header><strong>{day.toLocaleDateString("es-ES", { weekday: "long" })}</strong><span>{day.toLocaleDateString("es-ES", { day: "numeric", month: "short" })}</span>{key === today && <em>Hoy</em>}</header>{(["Comida", "Cena"] as RecipeKind[]).map((kind) => {
+      const recipe = calendar[key]?.[kind];
+      return <div className={`calendar-slot ${recipe ? "filled" : ""}`} key={kind}><span className="slot-label">{kind}</span>{recipe ? <><button className="scheduled-recipe" onClick={() => onOpen(recipe)}><span aria-hidden="true">{recipe.emoji}</span><strong>{recipe.title}</strong><small>{recipe.totalMinutes} min · {recipe.mode}</small></button><div className="slot-actions"><button onClick={() => onPick(key, kind)}>Cambiar</button><button className="remove-slot" onClick={() => onRemove(key, kind)} aria-label={`Quitar ${recipe.title} del ${day.toLocaleDateString("es-ES", { weekday: "long" })}`}>Quitar</button></div></> : <button className="empty-slot" onClick={() => onPick(key, kind)}><span>+</span>Añadir receta</button>}</div>;
+    })}</article>;
+  })}</div><p className="calendar-note">El calendario se guarda en este dispositivo y no se borra al generar recetas nuevas.</p></section>;
+}
+
+function ScheduleModal({ picker, weekStart, calendar, recipes, onAssign, onClose, onBrowseRecipes }: {
+  picker: CalendarPicker;
+  weekStart: Date;
+  calendar: CalendarPlan;
+  recipes: Recipe[];
+  onAssign: (day: string, kind: RecipeKind, recipe: Recipe) => void;
+  onClose: () => void;
+  onBrowseRecipes: () => void;
+}) {
+  const fixedRecipe = picker.recipe;
+  const kind = fixedRecipe?.kind ?? picker.kind;
+  const available = kind ? recipes.filter((recipe) => recipe.kind === kind) : [];
+  const day = picker.dateKey ? daysInWeek(weekStart).find((candidate) => dateKey(candidate) === picker.dateKey) : undefined;
+  return <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="schedule-title"><div className="schedule-card"><button className="close-button" onClick={onClose} aria-label="Cerrar">×</button>{fixedRecipe ? <><span className="schedule-icon">▦</span><h2 id="schedule-title">Añadir al calendario</h2><p><strong>{fixedRecipe.title}</strong><br/>Elige un día de esta semana para la {fixedRecipe.kind.toLowerCase()}.</p><div className="schedule-week-label">{weekLabel(weekStart)}</div><div className="day-picker">{daysInWeek(weekStart).map((candidate) => {
+    const key = dateKey(candidate);
+    const occupied = calendar[key]?.[fixedRecipe.kind];
+    return <button key={key} onClick={() => onAssign(key, fixedRecipe.kind, fixedRecipe)}><span>{candidate.toLocaleDateString("es-ES", { weekday: "short" })}</span><strong>{candidate.getDate()}</strong><small>{occupied ? `Sustituye: ${occupied.title}` : fixedRecipe.kind}</small></button>;
+  })}</div></> : <><span className="schedule-icon">🍽️</span><h2 id="schedule-title">Elegir {kind?.toLowerCase()}</h2><p>{day ? `${day.toLocaleDateString("es-ES", { weekday: "long", day: "numeric", month: "long" })}` : "Selecciona una receta"}</p>{available.length ? <div className="recipe-picker-list">{available.map((recipe) => <button key={recipe.id} onClick={() => picker.dateKey && kind && onAssign(picker.dateKey, kind, recipe)}><span aria-hidden="true">{recipe.emoji}</span><div><strong>{recipe.title}</strong><small>{recipe.totalMinutes} min · {recipe.mode}</small></div><em>+</em></button>)}</div> : <div className="picker-empty"><p>No tienes recetas de {kind?.toLowerCase()} disponibles.</p><button className="primary-button compact" onClick={onBrowseRecipes}>Ver recetas</button></div>}</>}</div></div>;
 }
 
 function RecipeCard({ recipe, favorite, onOpen, onFavorite }: { recipe: Recipe; favorite: boolean; onOpen: () => void; onFavorite: () => void }) {
@@ -880,7 +1041,7 @@ function EmptyState({ icon, title, text, action, actionLabel = "Generar recetas"
 }
 
 function ConfirmModal({ onCancel, onConfirm }: { onCancel: () => void; onConfirm: () => void }) {
-  return <div className="modal-backdrop"><div className="confirm-card"><button className="close-button" onClick={onCancel}>×</button><div className="confirm-icon">↻</div><h2>¿Quieres generar nuevas recetas?</h2><p>Las recetas actuales que no hayas guardado como favoritas y la lista de la compra serán sustituidas.</p><div className="safe-note">♥ Tus recetas favoritas se conservarán</div><div className="modal-actions"><button className="secondary-button" onClick={onCancel}>Cancelar</button><button className="primary-button compact" onClick={onConfirm}>Continuar y generar</button></div></div></div>;
+  return <div className="modal-backdrop"><div className="confirm-card"><button className="close-button" onClick={onCancel}>×</button><div className="confirm-icon">↻</div><h2>¿Quieres generar nuevas recetas?</h2><p>Las recetas actuales que no hayas guardado como favoritas y la lista de la compra serán sustituidas.</p><div className="safe-note">♥ Tus favoritas y las recetas del calendario se conservarán</div><div className="modal-actions"><button className="secondary-button" onClick={onCancel}>Cancelar</button><button className="primary-button compact" onClick={onConfirm}>Continuar y generar</button></div></div></div>;
 }
 
 function ConstraintWarningModal({ message, onClose }: { message: string; onClose: () => void }) {
@@ -907,7 +1068,7 @@ function Wizard({ step, setStep, config, setConfig, onClose, onFinish, generatin
   return <div className="wizard-screen"><header><button className="back-button" onClick={step === 1 ? onClose : () => setStep(step - 1)}>←</button><div><strong>Generar recetas</strong><small>Paso {step} de 5</small></div><button className="close-button" onClick={onClose}>×</button></header><div className="progress"><span style={{ width: `${step * 20}%` }} /></div><div className="wizard-content">
     {generating ? <div className="generating"><div className="spinner">🥗</div><h1>Preparando tus recetas…</h1><p>Estamos combinando opciones sencillas y equilibradas.</p><div className="generation-steps"><span className="done">✓ Preferencias revisadas</span><span className="done">✓ Recetas seleccionadas</span><span>○ Creando la lista de la compra</span></div></div> : <>
       {step === 1 && <div className="wizard-step"><span className="step-emoji">👨‍👩‍👧</span><h1>¿Para cuántas personas?</h1><p>Adaptaremos las cantidades y el tipo de receta.</p><FieldLabel text="Adultos" required/><div className="choice-grid two"><Choice active={config.adults === 1} onClick={() => setConfig({ ...config, adults: 1 })} title="1 adulto"/><Choice active={config.adults === 2} onClick={() => setConfig({ ...config, adults: 2 })} title="2 adultos"/></div><FieldLabel text="Niños" hint="Referencia nutricional: 6 a 10 años"/><div className="choice-grid three"><Choice active={config.children === 0} onClick={() => setConfig({ ...config, children: 0 })} title="Ninguno"/><Choice active={config.children === 1} onClick={() => setConfig({ ...config, children: 1 })} title="1 niño"/><Choice active={config.children === 2} onClick={() => setConfig({ ...config, children: 2 })} title="2 niños"/></div><div className="info-note">{config.children ? "Generaremos recetas familiares sanas y equilibradas." : "Generaremos recetas low carb para adultos."}</div></div>}
-      {step === 2 && <div className="wizard-step"><span className="step-emoji">🍽️</span><h1>¿Cuántas recetas necesitas?</h1><p>Elige de 0 a 5. No asignaremos días a las recetas.</p><Counter label="Comidas" value={config.lunches} onChange={(lunches) => setConfig({ ...config, lunches })}/><Counter label="Cenas" value={config.dinners} onChange={(dinners) => setConfig({ ...config, dinners })}/>{totalRecipes === 0 ? <div className="error-note">Selecciona al menos una comida o cena.</div> : <div className="selection-total"><strong>{totalRecipes}</strong><span>recetas en total</span></div>}</div>}
+      {step === 2 && <div className="wizard-step"><span className="step-emoji">🍽️</span><h1>¿Cuántas recetas necesitas?</h1><p>Elige de 0 a 5. Podrás asignarlas después en el calendario.</p><Counter label="Comidas" value={config.lunches} onChange={(lunches) => setConfig({ ...config, lunches })}/><Counter label="Cenas" value={config.dinners} onChange={(dinners) => setConfig({ ...config, dinners })}/>{totalRecipes === 0 ? <div className="error-note">Selecciona al menos una comida o cena.</div> : <div className="selection-total"><strong>{totalRecipes}</strong><span>recetas en total</span></div>}</div>}
       {step === 3 && <div className="wizard-step"><span className="step-emoji">⏱️</span><h1>¿Cuánto tiempo quieres cocinar?</h1><p>El límite se aplicará al tiempo total de cada receta.</p><div className="time-choices"><TimeChoice active={config.timeBand === "quick"} onClick={() => setConfig({ ...config, timeBand: "quick" })} title="Hasta 30 minutos" detail="Recetas rápidas para el día a día"/><TimeChoice active={config.timeBand === "medium"} onClick={() => setConfig({ ...config, timeBand: "medium" })} title="Entre 30 y 60 minutos" detail="Algo más de elaboración, sin complicarse"/><TimeChoice active={config.timeBand === "slow"} onClick={() => setConfig({ ...config, timeBand: "slow" })} title="Entre 1 y 2 horas" detail="Para cocinar con más calma"/></div><div className="info-note">Cada receta mostrará el tiempo activo y el tiempo total.</div></div>}
       {step === 4 && <div className="wizard-step"><span className="step-emoji">🍳</span><h1>¿Qué tienes en tu cocina?</h1><p>Usaremos como máximo dos utensilios principales por receta.</p><div className="tool-grid">{TOOLS.map((tool) => <Choice key={tool} active={config.tools.includes(tool)} onClick={() => toggleTool(tool)} title={tool} check/>)}</div><FieldLabel text="Otro utensilio"/><input className="text-input" value={config.otherTool} onChange={(event) => setConfig({ ...config, otherTool: event.target.value })} placeholder="Ej. plancha eléctrica"/>{!canFinish && <div className="error-note">Selecciona al menos un utensilio disponible.</div>}</div>}
       {step === 5 && <div className="wizard-step"><span className="step-emoji">🌿</span><h1>Últimos detalles</h1><p>Indica restricciones o ingredientes que quieras aprovechar.</p><FieldLabel text="Alergias o intolerancias"/><textarea className="text-input textarea" value={config.allergies} onChange={(event) => setConfig({ ...config, allergies: event.target.value })} placeholder="Ej. lactosa, frutos secos…"/><FieldLabel text="Alimentos a evitar"/><textarea className="text-input textarea" value={config.avoid} onChange={(event) => setConfig({ ...config, avoid: event.target.value })} placeholder="Ej. champiñones, cebolla…"/><FieldLabel text="Alimentos a incluir" hint="Opcional · máximo 3"/><textarea className="text-input textarea" value={config.include} onChange={(event) => setConfig({ ...config, include: event.target.value })} placeholder="Ej. boniato, arroz basmati…"/><div className="include-note">Los incluiremos en una cantidad útil en al menos una receta, no necesariamente en todas.</div>{requestedFoods.length > 3 && <div className="error-note">Introduce como máximo tres alimentos, separados por comas.</div>}{includeConflicts.length > 0 && <div className="error-note">No podemos incluir {includeConflicts.join(", ")} porque también aparece en alergias o alimentos a evitar.</div>}{unsafeForChildren.length > 0 && <div className="error-note">No podemos incluir {unsafeForChildren.join(", ")} en recetas destinadas a niños.</div>}<div className="summary-card"><strong>Tu selección</strong><span>{config.adults} {config.adults === 1 ? "adulto" : "adultos"}{config.children ? ` · ${config.children} ${config.children === 1 ? "niño" : "niños"}` : ""}</span><span>{config.lunches} comidas · {config.dinners} cenas</span><span>{config.timeBand === "quick" ? "Hasta 30 min" : config.timeBand === "medium" ? "Entre 30 y 60 min" : "Entre 1 y 2 horas"}</span>{config.allergies.trim() && <span>Alergias: {config.allergies.trim()}</span>}{config.avoid.trim() && <span>Evitar: {config.avoid.trim()}</span>}{requestedFoods.length > 0 && <span>Incluir: {requestedFoods.join(", ")}</span>}</div><div className="demo-note">Si un alimento solicitado impide mantener el objetivo nutricional, la receta se generará con un aviso visible. Las alergias y los alimentos a evitar siempre tienen prioridad.</div></div>}
@@ -920,7 +1081,7 @@ function Choice({ active, onClick, title, check }: { active: boolean; onClick: (
 function TimeChoice({ active, onClick, title, detail }: { active: boolean; onClick: () => void; title: string; detail: string }) { return <button className={`time-choice ${active ? "active" : ""}`} onClick={onClick}><i>{active ? "✓" : ""}</i><span><strong>{title}</strong><small>{detail}</small></span></button>; }
 function Counter({ label, value, onChange }: { label: string; value: number; onChange: (value: number) => void }) { return <div className="counter"><div><strong>{label}</strong><small>De 0 a 5 recetas</small></div><div><button disabled={value === 0} onClick={() => onChange(value - 1)}>−</button><span>{value}</span><button disabled={value === 5} onClick={() => onChange(value + 1)}>+</button></div></div>; }
 
-function RecipeDetail({ recipe, favorite, cookStep, setCookStep, onClose, onFavorite, onReplace, canReplace }: { recipe: Recipe; favorite: boolean; cookStep: number | null; setCookStep: (step: number | null) => void; onClose: () => void; onFavorite: () => void; onReplace: () => void; canReplace: boolean }) {
+function RecipeDetail({ recipe, favorite, cookStep, setCookStep, onClose, onFavorite, onReplace, onSchedule, onShare, sharing, canReplace }: { recipe: Recipe; favorite: boolean; cookStep: number | null; setCookStep: (step: number | null) => void; onClose: () => void; onFavorite: () => void; onReplace: () => void; onSchedule: () => void; onShare: () => void; sharing: boolean; canReplace: boolean }) {
   if (cookStep !== null) return <div className="detail-screen cook-mode"><header><button className="back-button" onClick={() => setCookStep(null)}>←</button><div><strong>Cocinar paso a paso</strong><small>{recipe.title}</small></div><button className="close-button" onClick={onClose}>×</button></header><div className="cook-content"><span className="cook-count">Paso {cookStep + 1} de {recipe.steps.length}</span><div className="cook-emoji">{recipe.emoji}</div><p>{recipe.steps[cookStep]}</p></div><footer><button className="secondary-button" disabled={cookStep === 0} onClick={() => setCookStep(Math.max(0, cookStep - 1))}>← Anterior</button><button className="primary-button compact" onClick={() => cookStep === recipe.steps.length - 1 ? setCookStep(null) : setCookStep(cookStep + 1)}>{cookStep === recipe.steps.length - 1 ? "Terminar ✓" : "Siguiente →"}</button></footer></div>;
-  return <div className="detail-screen"><header><button className="back-button" onClick={onClose}>←</button><div><strong>{recipe.kind}</strong><small>{recipe.mode}</small></div><button className={favorite ? "favorite detail-fav active" : "favorite detail-fav"} onClick={onFavorite}>{favorite ? "♥" : "♡"}</button></header><div className={`detail-hero ${recipe.mode === "Familiar" ? "family" : "lowcarb"}`}><span>{recipe.emoji}</span><div><div className="recipe-tags"><em>{recipe.kind}</em><em>{recipe.mode}</em>{recipe.requestedException && <em className="exception-tag">Excepción solicitada</em>}</div><h1>{recipe.title}</h1><p>Una receta sencilla, sabrosa y pensada para tu selección.</p></div></div><div className="detail-content"><div className="stat-row"><div><small>Tiempo activo</small><strong>{recipe.activeMinutes} min</strong></div><div><small>Tiempo total</small><strong>{recipe.totalMinutes} min</strong></div><div><small>Raciones</small><strong>{recipe.servings}</strong></div><div><small>Dificultad</small><strong>{recipe.difficulty}</strong></div></div>{recipe.requestedException && <div className="requested-exception-note"><span>⚠</span><div><strong>Excepción por alimento solicitado</strong><p>{recipe.requestedExceptionReason}</p></div></div>}<section><h2>Información nutricional <small>por ración</small></h2><div className="nutrition-card"><div className="calories"><strong>{recipe.calories}</strong><span>kcal</span></div><div className="metric-list"><MetricBar label="Proteínas" value={recipe.protein} kind="protein"/><MetricBar label="Hidratos" value={recipe.carbs} kind="carbs"/></div></div></section><section><h2>Utensilios</h2><p className="section-intro">Ten preparados estos utensilios principales antes de empezar.</p><div className="recipe-tool-list" aria-label="Utensilios necesarios">{recipe.tools.map((tool) => <div className="recipe-tool" key={tool}><span aria-hidden="true">{toolEmoji(tool)}</span><strong>{tool}</strong></div>)}</div></section><section><h2>Ingredientes</h2><ul className="ingredient-list">{recipe.ingredients.map((ingredient) => <li key={ingredient.name}><span>{ingredient.name}</span><strong>{ingredient.amount} {ingredient.unit}</strong></li>)}</ul></section>{recipe.childNote && <div className="child-note"><span>👧</span><div><strong>Adaptación infantil</strong><p>{recipe.childNote}</p></div></div>}<section><h2>Preparación</h2><ol className="steps-list">{recipe.steps.map((step, index) => <li key={step}><span>{index + 1}</span><p>{step}</p></li>)}</ol></section><div className="detail-actions"><button className="primary-button" onClick={() => setCookStep(0)}>Cocinar paso a paso →</button>{canReplace && <button className="secondary-button" onClick={onReplace}>↻ Cambiar esta receta</button>}</div><p className="nutrition-disclaimer">Valores nutricionales aproximados. Revisa siempre los ingredientes en caso de alergia o intolerancia.</p></div></div>;
+  return <div className="detail-screen"><header><button className="back-button" onClick={onClose}>←</button><div><strong>{recipe.kind}</strong><small>{recipe.mode}</small></div><button className={favorite ? "favorite detail-fav active" : "favorite detail-fav"} onClick={onFavorite}>{favorite ? "♥" : "♡"}</button></header><div className={`detail-hero ${recipe.mode === "Familiar" ? "family" : "lowcarb"}`}><span>{recipe.emoji}</span><div><div className="recipe-tags"><em>{recipe.kind}</em><em>{recipe.mode}</em>{recipe.requestedException && <em className="exception-tag">Excepción solicitada</em>}</div><h1>{recipe.title}</h1><p>Una receta sencilla, sabrosa y pensada para tu selección.</p></div></div><div className="detail-content"><div className="stat-row"><div><small>Tiempo activo</small><strong>{recipe.activeMinutes} min</strong></div><div><small>Tiempo total</small><strong>{recipe.totalMinutes} min</strong></div><div><small>Raciones</small><strong>{recipe.servings}</strong></div><div><small>Dificultad</small><strong>{recipe.difficulty}</strong></div></div>{recipe.requestedException && <div className="requested-exception-note"><span>⚠</span><div><strong>Excepción por alimento solicitado</strong><p>{recipe.requestedExceptionReason}</p></div></div>}<section><h2>Información nutricional <small>por ración</small></h2><div className="nutrition-card"><div className="calories"><strong>{recipe.calories}</strong><span>kcal</span></div><div className="metric-list"><MetricBar label="Proteínas" value={recipe.protein} kind="protein"/><MetricBar label="Hidratos" value={recipe.carbs} kind="carbs"/></div></div></section><section><h2>Utensilios</h2><p className="section-intro">Ten preparados estos utensilios principales antes de empezar.</p><div className="recipe-tool-list" aria-label="Utensilios necesarios">{recipe.tools.map((tool) => <div className="recipe-tool" key={tool}><span aria-hidden="true">{toolEmoji(tool)}</span><strong>{tool}</strong></div>)}</div></section><section><h2>Ingredientes</h2><ul className="ingredient-list">{recipe.ingredients.map((ingredient) => <li key={ingredient.name}><span>{ingredient.name}</span><strong>{ingredient.amount} {ingredient.unit}</strong></li>)}</ul></section>{recipe.childNote && <div className="child-note"><span>👧</span><div><strong>Adaptación infantil</strong><p>{recipe.childNote}</p></div></div>}<section><h2>Preparación</h2><ol className="steps-list">{recipe.steps.map((step, index) => <li key={step}><span>{index + 1}</span><p>{step}</p></li>)}</ol></section><div className="detail-actions"><button className="primary-button" onClick={() => setCookStep(0)}>Cocinar paso a paso →</button><button className="secondary-button" onClick={onSchedule}>▦ Añadir al calendario</button><button className="secondary-button" onClick={onShare} disabled={sharing}>{sharing ? "Creando PDF…" : "↗ Compartir PDF"}</button>{canReplace && <button className="secondary-button" onClick={onReplace}>↻ Cambiar esta receta</button>}</div><p className="nutrition-disclaimer">Valores nutricionales aproximados. Revisa siempre los ingredientes en caso de alergia o intolerancia.</p></div></div>;
 }
